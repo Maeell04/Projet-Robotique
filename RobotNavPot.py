@@ -37,6 +37,27 @@ def creer_points_cercle(centre, rayon, pas_deg):
     return points
 
 
+def point_dans_cercle(point, centre, rayon, marge=1e-6):
+    if point is None:
+        return False
+    return distance_points(point, centre) <= rayon + marge
+
+
+def point_dans_anciens_cercles(point, cercles):
+    if point is None:
+        return False
+    for cercle in cercles:
+        if point_dans_cercle(point, cercle['centre'], cercle['rayon']):
+            return True
+    return False
+
+
+def nettoyer_file_points(file_points, cercles):
+    if not file_points:
+        return
+    file_points[:] = [pt for pt in file_points if not point_dans_anciens_cercles(pt, cercles)]
+
+
 def analyser_mesures_cercle(mesures, seuil):
     segments = []
     segment = []
@@ -157,8 +178,8 @@ pot = Potential.Potential(difficulty=choix_difficulte, random=choix_hasard)
 
 # paramètres principaux
 pot_seuil = 305.0
-liste_rayon = [0.0, 10.0, 10.0, 18.0]
-liste_fusion = [0.0, 10.0, 10.0, 16.0]
+liste_rayon = [0.0, 10.0, 9.0, 18.0]
+liste_fusion = [0.0, 10.0, 9.0, 16.0]
 rayon_cercle = liste_rayon[choix_difficulte]
 pas_angle = 10.0
 dist_fusion = liste_fusion[choix_difficulte]
@@ -185,6 +206,9 @@ point_courant = None
 pot_point_courant = None
 pot_centre_cercle = 0.0
 retour_active = False
+cercles_explores = []
+toutes_mesures_cercles = []
+cible_depuis_fusion = False
 
 
 # position control loop: gain and timer
@@ -245,7 +269,10 @@ for t in simu.t:
 
         elif etat == 'avance':
             if file_points and not retour_active:
+                nettoyer_file_points(file_points, cercles_explores)
+            if file_points and not retour_active:
                 point_cible = file_points.pop(0)
+                cible_depuis_fusion = False
                 etat = 'aller_point_detection'
                 Vr = 0.0
             else:
@@ -266,12 +293,19 @@ for t in simu.t:
                         direction_marche = normaliser_angle(direction_marche + math.pi / 2.0)
 
         elif etat == 'aller_point_detection':
+            if not cible_depuis_fusion and point_dans_anciens_cercles(point_cible, cercles_explores):
+                point_cible = None
+                etat = 'avance'
+                cible_depuis_fusion = False
+                Vr = 0.0
+                continue
             thetar = math.atan2(point_cible[1] - robot.y, point_cible[0] - robot.x)
             dist_point = distance_points((robot.x, robot.y), point_cible)
             if dist_point <= tolerance_point:
                 point_courant = point_cible
                 pot_point_courant = pot_actuel
                 etat = 'initialiser_cercle'
+                cible_depuis_fusion = False
                 Vr = 0.0
                 timerMesure.reset(t)
             else:
@@ -323,8 +357,11 @@ for t in simu.t:
         elif etat == 'analyse_cercle':
             Vr = 0.0
             detections = analyser_mesures_cercle(mesures_cercle, pot_seuil)
+            mesures_actuelles = list(mesures_cercle)
             points_a_explorer = []
             zones_a_ajouter = []
+            point_prioritaire = None
+            meilleur_pot_prioritaire = None
             for detection in detections:
                 mesure_ref = detection['mesure']
                 pos_mes = mesure_ref[2]
@@ -332,12 +369,18 @@ for t in simu.t:
                 if dist_mesure <= dist_fusion:
                     pos_estimee = estimer_centre_ligne(centre_cercle, pot_centre_cercle, mesure_ref)
                     zones_a_ajouter.append(pos_estimee)
+                    if len(zones_trouvees) + len(zones_a_ajouter) < nb_zones:
+                        if meilleur_pot_prioritaire is None or mesure_ref[0] > meilleur_pot_prioritaire:
+                            point_prioritaire = pos_mes
+                            meilleur_pot_prioritaire = mesure_ref[0]
                 else:
                     points_a_explorer.append(pos_mes)
 
             if points_a_explorer:
                 points_a_explorer = fusionner_positions(points_a_explorer, dist_fusion)
                 for pt in points_a_explorer:
+                    if point_dans_anciens_cercles(pt, cercles_explores):
+                        continue
                     proche = False
                     for zone in zones_trouvees:
                         if distance_points(zone, pt) <= dist_fusion:
@@ -375,14 +418,35 @@ for t in simu.t:
                 if valide:
                     zones_trouvees.append(centre_estime)
 
+            prochain_point = None
+            prioritaire_selectionne = False
+            if point_prioritaire is not None and not retour_active:
+                prochain_point = point_prioritaire
+                prioritaire_selectionne = True
+            elif file_points and not retour_active:
+                prochain_point = file_points.pop(0)
+
             if len(zones_trouvees) >= nb_zones and not retour_active:
                 retour_active = True
                 etat = 'retour'
-            elif file_points and not retour_active:
-                point_cible = file_points.pop(0)
+            elif prochain_point is not None and not retour_active:
+                point_cible = prochain_point
+                if prioritaire_selectionne:
+                    cible_depuis_fusion = prioritaire_selectionne
                 etat = 'aller_point_detection'
             else:
                 etat = 'avance'
+
+            cercle_actuel = {
+                'centre': centre_cercle,
+                'rayon': rayon_cercle,
+                'points': [mes[2] for mes in mesures_actuelles],
+                'mesures': mesures_actuelles
+            }
+            cercles_explores.append(cercle_actuel)
+            if mesures_actuelles:
+                toutes_mesures_cercles.extend(mesures_actuelles)
+            nettoyer_file_points(file_points, cercles_explores)
 
             mesures_cercle = []
             points_cercle = []
