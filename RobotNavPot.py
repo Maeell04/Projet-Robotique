@@ -14,6 +14,12 @@ import Timer as tmr
 import Potential
 
 
+MIN_COORD_MATRICE = -25
+MAX_COORD_MATRICE = 25
+TAILLE_MATRICE = MAX_COORD_MATRICE - MIN_COORD_MATRICE + 1
+RAYON_ACTIVATION_NAVIGATION = 10.0
+MAX_CERCLES_CONSECUTIFS = 2
+
 def normaliser_angle(angle):
     while angle > math.pi:
         angle -= 2.0 * math.pi
@@ -161,6 +167,86 @@ def estimer_centre_zone(mesures):
         return None
     return (somme_x / somme_poids, somme_y / somme_poids)
 
+
+def arrondir_coord(valeur):
+    if valeur >= 0.0:
+        return int(math.floor(valeur + 0.5))
+    return int(math.ceil(valeur - 0.5))
+
+
+def mettre_a_jour_matrice(matrice, x, y, potentiel):
+    ix = arrondir_coord(x)
+    iy = arrondir_coord(y)
+    if (
+        ix < MIN_COORD_MATRICE
+        or ix > MAX_COORD_MATRICE
+        or iy < MIN_COORD_MATRICE
+        or iy > MAX_COORD_MATRICE
+    ):
+        return False
+    idx_x = ix - MIN_COORD_MATRICE
+    idx_y = iy - MIN_COORD_MATRICE
+    valeur_actuelle = matrice[idx_x][idx_y]
+    if valeur_actuelle == 0.0:
+        matrice[idx_x][idx_y] = potentiel
+    else:
+        matrice[idx_x][idx_y] = (valeur_actuelle + potentiel) / 2.0
+    return True
+
+
+def trouver_plus_gros_carre_inexplore(matrice):
+    if not matrice:
+        return None
+    taille_x = len(matrice)
+    taille_y = len(matrice[0]) if matrice[0] else 0
+    if taille_y == 0:
+        return None
+
+    dp = [[0 for _ in range(taille_y)] for _ in range(taille_x)]
+    meilleure_taille = 0
+    meilleur_depart = None
+
+    for i in reversed(range(taille_x)):
+        for j in reversed(range(taille_y)):
+            if matrice[i][j] != 0.0:
+                dp[i][j] = 0
+                continue
+            taille_case = 1
+            if i + 1 < taille_x and j + 1 < taille_y:
+                taille_case += min(dp[i + 1][j], dp[i][j + 1], dp[i + 1][j + 1])
+            dp[i][j] = taille_case
+            if taille_case > meilleure_taille:
+                meilleure_taille = taille_case
+                meilleur_depart = (i, j)
+
+    if meilleure_taille == 0 or meilleur_depart is None:
+        return None
+
+    depart_i, depart_j = meilleur_depart
+    centre_i = depart_i + (meilleure_taille - 1) / 2.0
+    centre_j = depart_j + (meilleure_taille - 1) / 2.0
+    coord_x = MIN_COORD_MATRICE + centre_i
+    coord_y = MIN_COORD_MATRICE + centre_j
+    return (arrondir_coord(coord_x), arrondir_coord(coord_y))
+
+
+def calculer_direction_depuis_mesures(mesures):
+    if len(mesures) < 3:
+        return None
+    echantillons = mesures[-3:]
+    matrice_systeme = np.array([[x, y, 1.0] for x, y, _ in echantillons], dtype=float)
+    vecteur_potentiels = np.array([potentiel for _, _, potentiel in echantillons], dtype=float)
+    try:
+        coeffs, _, _, _ = np.linalg.lstsq(matrice_systeme, vecteur_potentiels, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    grad_x, grad_y = coeffs[0], coeffs[1]
+    norme = math.hypot(grad_x, grad_y)
+    if norme == 0.0:
+        return None
+    return math.atan2(grad_y, grad_x)
+
+
 # saisie utilisateur
 choix_difficulte = int(input("Choisir la difficulté (1, 2 ou 3) : "))
 choix_hasard = input("Nuage aléatoire ? (T/F) : ").strip().upper() == 'T'
@@ -177,21 +263,20 @@ robot = rob.Robot(x0, y0, theta0)
 pot = Potential.Potential(difficulty=choix_difficulte, random=choix_hasard)
 
 # paramètres principaux
-pot_seuil = 305.0
-liste_rayon = [0.0, 10.0, 9.0, 18.0]
-liste_fusion = [0.0, 10.0, 9.0, 16.0]
+pot_seuil = 300.0
+liste_rayon = [0.0, 11.0, 9.0, 10.0]
+liste_fusion = [0.0, 11.0, 9.0, 10.0]
 rayon_cercle = liste_rayon[choix_difficulte]
 pas_angle = 10.0
 dist_fusion = liste_fusion[choix_difficulte]
 v_avance = 1.0
 v_point = 0.8
 tolerance_point = 0.5
-tolerance_angle = 0.05
-periode_mesure = 0.5
+periode_mesure = 0.25
 nb_zones = choix_difficulte
 
 # stockage des mesures et états
-mesures_trajet = []
+matrice_mesures = [[0.0 for _ in range(TAILLE_MATRICE)] for _ in range(TAILLE_MATRICE)]
 file_points = []
 zones_trouvees = []
 mesures_cercle = []
@@ -199,8 +284,9 @@ points_cercle = []
 indice_cercle = 0
 centre_cercle = None
 point_cible = None
-etat = 'orientation'
-direction_marche = math.atan2(-y0, -x0)
+point_objectif = None
+etat = 'aller_point_objectif'
+direction_marche = robot.theta
 point_depart = (x0, y0)
 point_courant = None
 pot_point_courant = None
@@ -209,7 +295,10 @@ retour_active = False
 cercles_explores = []
 toutes_mesures_cercles = []
 cible_depuis_fusion = False
-
+historique_mesures_avance = []
+navigation_intelligente_active = False
+compteur_gradient_nul = 0
+compteur_cercles_consecutifs = 0
 
 # position control loop: gain and timer
 kpPos = 0.8
@@ -233,7 +322,7 @@ WPManager = rob.WPManager(WPlist, epsilonWP)
 
 # duration of scenario and time step for numerical integration
 t0 = 0.0
-tf = 800.0
+tf = 1200.0
 dt = 0.01
 simu = rob.RobotSimulation(robot, t0, tf, dt)
 
@@ -260,14 +349,16 @@ for t in simu.t:
     # position control loop
     if timerPositionCtrl.isEllapsed(t):
 
-        if etat == 'orientation':
-            thetar = math.atan2(-robot.y, -robot.x)
-            Vr = 0.0
-            if abs(normaliser_angle(robot.theta - thetar)) < tolerance_angle:
-                etat = 'avance'
-                direction_marche = thetar
-
-        elif etat == 'avance':
+        if etat == 'avance':
+            if not navigation_intelligente_active and not retour_active:
+                if not file_points:
+                    etat = 'aller_point_objectif'
+                    point_objectif = None
+                    navigation_intelligente_active = False
+                    compteur_gradient_nul = 0
+                    historique_mesures_avance.clear()
+                    compteur_cercles_consecutifs = 0
+                    continue
             if file_points and not retour_active:
                 nettoyer_file_points(file_points, cercles_explores)
             if file_points and not retour_active:
@@ -275,28 +366,123 @@ for t in simu.t:
                 cible_depuis_fusion = False
                 etat = 'aller_point_detection'
                 Vr = 0.0
+                historique_mesures_avance.clear()
+                compteur_gradient_nul = 0
             else:
                 thetar = direction_marche
                 Vr = v_avance
                 WPManager.xr = robot.x + math.cos(thetar)
                 WPManager.yr = robot.y + math.sin(thetar)
                 if timerMesure.isEllapsed(t):
-                    mesures_trajet.append((t, robot.x, robot.y, pot_actuel))
+                    mettre_a_jour_matrice(matrice_mesures, robot.x, robot.y, pot_actuel)
+                    if navigation_intelligente_active:
+                        historique_mesures_avance.append((robot.x, robot.y, pot_actuel))
+                        if len(historique_mesures_avance) > 3:
+                            historique_mesures_avance.pop(0)
+                        nouvelle_direction = calculer_direction_depuis_mesures(historique_mesures_avance)
+                        if nouvelle_direction is not None:
+                            direction_marche = normaliser_angle(nouvelle_direction)
+                            thetar = direction_marche
+                            WPManager.xr = robot.x + math.cos(thetar)
+                            WPManager.yr = robot.y + math.sin(thetar)
+                            compteur_gradient_nul = 0
+                        else:
+                            compteur_gradient_nul += 1
+                            if (
+                                compteur_gradient_nul >= 5
+                                and not retour_active
+                                and not file_points
+                            ):
+                                navigation_intelligente_active = False
+                                etat = 'aller_point_objectif'
+                                point_objectif = None
+                                historique_mesures_avance.clear()
+                                timerMesure.reset(t)
+                                continue
+                    elif historique_mesures_avance:
+                        historique_mesures_avance.clear()
                 if pot_actuel >= pot_seuil:
                     point_courant = (robot.x, robot.y)
                     pot_point_courant = pot_actuel
                     etat = 'initialiser_cercle'
                     Vr = 0.0
+                    historique_mesures_avance.clear()
                     timerMesure.reset(t)
                 else:
                     if abs(robot.x) >= 24.0 or abs(robot.y) >= 24.0:
                         direction_marche = normaliser_angle(direction_marche + math.pi / 2.0)
+                        thetar = direction_marche
+                        WPManager.xr = robot.x + math.cos(thetar)
+                        WPManager.yr = robot.y + math.sin(thetar)
+
+        elif etat == 'aller_point_objectif':
+            navigation_intelligente_active = False
+            compteur_gradient_nul = 0
+            compteur_cercles_consecutifs = 0
+            if historique_mesures_avance:
+                historique_mesures_avance.clear()
+            if file_points and not retour_active:
+                nettoyer_file_points(file_points, cercles_explores)
+            if file_points and not retour_active:
+                point_cible = file_points.pop(0)
+                cible_depuis_fusion = False
+                etat = 'aller_point_detection'
+                Vr = 0.0
+                historique_mesures_avance.clear()
+                continue
+
+            if timerMesure.isEllapsed(t):
+                mettre_a_jour_matrice(matrice_mesures, robot.x, robot.y, pot_actuel)
+
+            if pot_actuel >= pot_seuil:
+                point_courant = (robot.x, robot.y)
+                pot_point_courant = pot_actuel
+                etat = 'initialiser_cercle'
+                Vr = 0.0
+                historique_mesures_avance.clear()
+                point_objectif = None
+                compteur_gradient_nul = 0
+                timerMesure.reset(t)
+                continue
+
+            if point_objectif is None:
+                resultat_carre = trouver_plus_gros_carre_inexplore(matrice_mesures)
+                if resultat_carre is not None:
+                    point_objectif = (float(resultat_carre[0]), float(resultat_carre[1]))
+
+            if point_objectif is not None:
+                thetar = math.atan2(point_objectif[1] - robot.y, point_objectif[0] - robot.x)
+                direction_marche = thetar
+                WPManager.xr = point_objectif[0]
+                WPManager.yr = point_objectif[1]
+                dist_obj = distance_points((robot.x, robot.y), point_objectif)
+                Vr = v_avance
+                if dist_obj <= tolerance_point:
+                    mettre_a_jour_matrice(matrice_mesures, robot.x, robot.y, pot_actuel)
+                    point_objectif = None
+                if dist_obj <= RAYON_ACTIVATION_NAVIGATION:
+                    navigation_intelligente_active = True
+                    compteur_gradient_nul = 0
+                    etat = 'avance'
+                    direction_marche = robot.theta
+                    point_objectif = None
+                    historique_mesures_avance.clear()
+                    timerMesure.reset(t)
+                    continue
+            else:
+                thetar = direction_marche
+                Vr = v_avance
+                WPManager.xr = robot.x + math.cos(thetar)
+                WPManager.yr = robot.y + math.sin(thetar)
 
         elif etat == 'aller_point_detection':
             if not cible_depuis_fusion and point_dans_anciens_cercles(point_cible, cercles_explores):
                 point_cible = None
                 etat = 'avance'
                 cible_depuis_fusion = False
+                point_objectif = None
+                navigation_intelligente_active = True
+                compteur_gradient_nul = 0
                 Vr = 0.0
                 continue
             thetar = math.atan2(point_cible[1] - robot.y, point_cible[0] - robot.x)
@@ -304,8 +490,11 @@ for t in simu.t:
             if dist_point <= tolerance_point:
                 point_courant = point_cible
                 pot_point_courant = pot_actuel
+                mettre_a_jour_matrice(matrice_mesures, robot.x, robot.y, pot_point_courant)
                 etat = 'initialiser_cercle'
                 cible_depuis_fusion = False
+                point_objectif = None
+                compteur_gradient_nul = 0
                 Vr = 0.0
                 timerMesure.reset(t)
             else:
@@ -314,6 +503,7 @@ for t in simu.t:
             WPManager.yr = point_cible[1]
 
         elif etat == 'initialiser_cercle':
+            compteur_cercles_consecutifs += 1
             centre_cercle = point_courant
             if pot_point_courant is None:
                 pot_centre_cercle = pot.value([centre_cercle[0], centre_cercle[1]])
@@ -344,6 +534,7 @@ for t in simu.t:
             if dist_point <= tolerance_point:
                 pot_point = pot_actuel
                 angle_point = point_temp[2]
+                mettre_a_jour_matrice(matrice_mesures, robot.x, robot.y, pot_point)
                 mesures_cercle.append((pot_point, angle_point, (robot.x, robot.y)))
                 indice_cercle += 1
                 if indice_cercle >= len(points_cercle):
@@ -362,6 +553,7 @@ for t in simu.t:
             zones_a_ajouter = []
             point_prioritaire = None
             meilleur_pot_prioritaire = None
+            limite_cercles_atteinte = compteur_cercles_consecutifs >= MAX_CERCLES_CONSECUTIFS
             for detection in detections:
                 mesure_ref = detection['mesure']
                 pos_mes = mesure_ref[2]
@@ -420,15 +612,28 @@ for t in simu.t:
 
             prochain_point = None
             prioritaire_selectionne = False
-            if point_prioritaire is not None and not retour_active:
+            if (
+                not limite_cercles_atteinte
+                and point_prioritaire is not None
+                and not retour_active
+            ):
                 prochain_point = point_prioritaire
                 prioritaire_selectionne = True
-            elif file_points and not retour_active:
+            elif not limite_cercles_atteinte and file_points and not retour_active:
                 prochain_point = file_points.pop(0)
 
             if len(zones_trouvees) >= nb_zones and not retour_active:
                 retour_active = True
                 etat = 'retour'
+                compteur_cercles_consecutifs = 0
+            elif limite_cercles_atteinte and not retour_active:
+                file_points.clear()
+                etat = 'aller_point_objectif'
+                point_objectif = None
+                navigation_intelligente_active = False
+                compteur_gradient_nul = 0
+                historique_mesures_avance.clear()
+                compteur_cercles_consecutifs = 0
             elif prochain_point is not None and not retour_active:
                 point_cible = prochain_point
                 if prioritaire_selectionne:
@@ -436,6 +641,9 @@ for t in simu.t:
                 etat = 'aller_point_detection'
             else:
                 etat = 'avance'
+                navigation_intelligente_active = True
+                compteur_gradient_nul = 0
+                point_objectif = None
 
             cercle_actuel = {
                 'centre': centre_cercle,
@@ -488,6 +696,10 @@ for t in simu.t:
 
 print("Zones trouvées :", zones_trouvees)
 print("Temps de simulation :", round(temps_simu, 2), "s")
+print("Matrice des potentiels (indices -25 à 25) :")
+for ix in range(TAILLE_MATRICE):
+    ligne = matrice_mesures[ix]
+    print(" ".join(f"{valeur:6.1f}" for valeur in ligne))
 
 
 # close all figures
@@ -514,9 +726,6 @@ simu.plotPotential3D(5)
 
 # show plots
 plt.show()
-
-
-
 
 
 # # Animation *********************************
@@ -549,7 +758,7 @@ plt.show()
 #     time_text.set_text('')
 #     potential_text.set_text('')
 #     return robotBody,robotDirection, wayPoint, time_text, potential_text, WPArea  
-    
+
 # def animate(i):  
 #     robotBody.set_data(simu.x[i], simu.y[i])          
 #     wayPoint.set_data(simu.xr[i], simu.yr[i])
@@ -566,4 +775,3 @@ plt.show()
 # #interval=25
 
 # #ani.save('robot.mp4', fps=15)
-
