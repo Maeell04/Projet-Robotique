@@ -1,15 +1,12 @@
 # -*- coding: utf-8 -*-
-"""
-Way Point navigtion
-
-(c) S. Bertrand
-"""
 
 import math
+from typing import Optional
 import Robot as rob
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+from matplotlib.patches import Circle
 import Timer as tmr
 import Potential
 
@@ -19,6 +16,39 @@ MAX_COORD_MATRICE = 25
 TAILLE_MATRICE = MAX_COORD_MATRICE - MIN_COORD_MATRICE + 1
 RAYON_ACTIVATION_NAVIGATION = 10.0
 MAX_CERCLES_CONSECUTIFS = 2
+
+RAYON_RECONSTRUCTION_BASE = 8.0
+LARGEUR_COURONNE_RECONSTRUCTION = 4.0
+
+class ParametresCercles:
+    seuil_ratio: float = 0.98
+    pourc_dist: float = 70.0
+    facteur_min_reference: float = 0.6
+    rayon_min: float = 2.5
+    largeur_ratio: float = 1
+    largeur_min: float = 2.0
+
+def configurer_reconstruction_cercles(*, rayon_base: Optional[float] = None, largeur_couronne: Optional[float] = None):
+
+    global RAYON_RECONSTRUCTION_BASE, LARGEUR_COURONNE_RECONSTRUCTION
+
+    if rayon_base is not None:
+        RAYON_RECONSTRUCTION_BASE = float(rayon_base)
+    if largeur_couronne is not None:
+        LARGEUR_COURONNE_RECONSTRUCTION = float(largeur_couronne)
+
+    return RAYON_RECONSTRUCTION_BASE, LARGEUR_COURONNE_RECONSTRUCTION
+
+
+def configurer_parametres_cercles(**kwargs):
+
+    global PARAMETRES_CERCLES
+
+    for cle, valeur in kwargs.items():
+        setattr(PARAMETRES_CERCLES, cle, float(valeur))
+
+    return PARAMETRES_CERCLES
+
 
 def normaliser_angle(angle):
     while angle > math.pi:
@@ -247,9 +277,230 @@ def calculer_direction_depuis_mesures(mesures):
     return math.atan2(grad_y, grad_x)
 
 
+def extraire_mesures_matrice(matrice):
+    mesures = []
+    for ix in range(len(matrice)):
+        for iy in range(len(matrice[0])):
+            valeur = matrice[ix][iy]
+            if valeur <= 0.0:
+                continue
+            x = MIN_COORD_MATRICE + ix
+            y = MIN_COORD_MATRICE + iy
+            mesures.append((x, y, valeur))
+    return mesures
+
+
+def valeur_matrice_coord(matrice, coord):
+    ix = arrondir_coord(coord[0])
+    iy = arrondir_coord(coord[1])
+    if (
+        ix < MIN_COORD_MATRICE
+        or ix > MAX_COORD_MATRICE
+        or iy < MIN_COORD_MATRICE
+        or iy > MAX_COORD_MATRICE
+    ):
+        return 0.0
+    idx_x = ix - MIN_COORD_MATRICE
+    idx_y = iy - MIN_COORD_MATRICE
+    return matrice[idx_x][idx_y]
+
+def determiner_valeur_centre(matrice, centre, mesures, seuil_detection):
+    valeur = valeur_matrice_coord(matrice, centre)
+    if valeur > 0.0:
+        return valeur
+    if not mesures:
+        return seuil_detection
+    rayon_recherche = 2.5
+    valeurs_proches = [
+        pot for (mx, my, pot) in mesures if distance_points((mx, my), centre) <= rayon_recherche
+    ]
+    if valeurs_proches:
+        return max(valeurs_proches)
+    return seuil_detection
+
+
+def calculer_intensite_cercles(distances, valeur_centre, baseline):
+    rayon_fort = RAYON_RECONSTRUCTION_BASE
+    largeur_couronne = LARGEUR_COURONNE_RECONSTRUCTION
+    rayon_intermediaire = rayon_fort + largeur_couronne
+    rayon_large = rayon_intermediaire + largeur_couronne
+
+    valeur_intermediaire = max(valeur_centre * 0.65, baseline + 1.0)
+    valeur_exterieure = max(valeur_centre * 0.35, baseline)
+
+    intensite = np.full_like(distances, baseline, dtype=float)
+
+    masque_fort = distances <= rayon_fort
+    intensite[masque_fort] = valeur_centre
+
+    masque_inter = (distances > rayon_fort) & (distances <= rayon_intermediaire)
+    if np.any(masque_inter):
+        proportion = (distances[masque_inter] - rayon_fort) / max(largeur_couronne, 1e-9)
+        intensite[masque_inter] = valeur_centre - (
+            valeur_centre - valeur_intermediaire
+        ) * proportion
+
+    masque_large = (distances > rayon_intermediaire) & (distances <= rayon_large)
+    if np.any(masque_large):
+        proportion = (distances[masque_large] - rayon_intermediaire) / max(largeur_couronne, 1e-9)
+        intensite[masque_large] = valeur_intermediaire - (
+            valeur_intermediaire - valeur_exterieure
+        ) * proportion
+
+    return (
+        intensite,
+        rayon_fort,
+        rayon_intermediaire,
+        rayon_large,
+        valeur_centre,
+        valeur_intermediaire,
+        valeur_exterieure,
+    )
+
+
+def reconstruire_carte_emissions(
+    matrice,
+    seuil_detection,
+    zones_reference=None,
+    rayon_detection=None,
+    mesures=None,
+):
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+    x = np.linspace(MIN_COORD_MATRICE, MAX_COORD_MATRICE, TAILLE_MATRICE)
+    y = np.linspace(MIN_COORD_MATRICE, MAX_COORD_MATRICE, TAILLE_MATRICE)
+    X, Y = np.meshgrid(x, y, indexing='ij')
+
+    mesures_matrice = extraire_mesures_matrice(matrice)
+    valeurs_non_nulles = [mes[2] for mes in mesures_matrice]
+    if valeurs_non_nulles:
+        baseline = min(valeurs_non_nulles)
+    else:
+        baseline = seuil_detection * 0.5
+
+    champ = np.full_like(X, baseline, dtype=float)
+    distance_assignation = np.full_like(X, np.inf, dtype=float)
+
+    cercles_trace = []
+
+    if zones_reference:
+        for centre in zones_reference:
+            valeur_centre = determiner_valeur_centre(
+                matrice, centre, mesures, seuil_detection
+            )
+            distances = np.hypot(X - centre[0], Y - centre[1])
+            (
+                intensite,
+                rayon_fort,
+                rayon_intermediaire,
+                rayon_large,
+                valeur_forte,
+                valeur_moyenne,
+                valeur_faible,
+            ) = calculer_intensite_cercles(distances, valeur_centre, baseline)
+
+            masque_proche = distances < distance_assignation
+            champ[masque_proche] = intensite[masque_proche]
+            distance_assignation[masque_proche] = distances[masque_proche]
+
+            cercles_trace.append(
+                (
+                    centre,
+                    rayon_fort,
+                    rayon_intermediaire,
+                    rayon_large,
+                    valeur_forte,
+                    valeur_moyenne,
+                    valeur_faible,
+                )
+            )
+
+    vmax = champ.max()
+    niveaux = np.linspace(baseline, vmax, 20)
+    cmap = plt.get_cmap('YlOrRd')
+
+    contour = ax.contourf(
+        X,
+        Y,
+        champ,
+        levels=niveaux,
+        cmap=cmap,
+        extend='both',
+    )
+
+    if zones_reference:
+        ax.scatter(
+            [pt[0] for pt in zones_reference],
+            [pt[1] for pt in zones_reference],
+            c='black',
+            marker='x',
+            s=55,
+            label='Centre détecté',
+        )
+        for centre, r_fort, r_inter, r_large, _, _, _ in cercles_trace:
+            cercle_fort = Circle(
+                centre,
+                r_fort,
+                fill=False,
+                color='#d73027',
+                linewidth=1.5,
+                label='Zone forte',
+            )
+            cercle_moyen = Circle(
+                centre,
+                r_inter,
+                fill=False,
+                color='#fc8d59',
+                linewidth=1.1,
+                linestyle='--',
+                label='Zone intermédiaire',
+            )
+            cercle_large = Circle(
+                centre,
+                r_large,
+                fill=False,
+                color='#fee08b',
+                linewidth=1.0,
+                linestyle=':',
+                label='Zone faible',
+            )
+            ax.add_patch(cercle_large)
+            ax.add_patch(cercle_moyen)
+            ax.add_patch(cercle_fort)
+
+        handles, labels = ax.get_legend_handles_labels()
+        unique = dict(zip(labels, handles))
+        ax.legend(unique.values(), unique.keys(), loc='upper right')
+    
+    cbar = fig.colorbar(contour, ax=ax)
+    cbar.set_label('Potentiel estimé')
+
+
+    ax.set_title("Carte reconstruite des zones d'émission")
+    ax.set_xlabel('x (m)')
+    ax.set_ylabel('y (m)')
+    ax.set_xlim(MIN_COORD_MATRICE, MAX_COORD_MATRICE)
+    ax.set_ylim(MIN_COORD_MATRICE, MAX_COORD_MATRICE)
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.15)
+    ax.text(
+        0.02,
+        0.02,
+        f'Seuil mission : {seuil_detection:.1f}',
+        transform=ax.transAxes,
+        color='white',
+        fontsize=9,
+        bbox=dict(facecolor='white', alpha=0.7, boxstyle='round,pad=0.2'),
+    )
+    return fig, ax
+
+
 # saisie utilisateur
 choix_difficulte = int(input("Choisir la difficulté (1, 2 ou 3) : "))
 choix_hasard = input("Nuage aléatoire ? (T/F) : ").strip().upper() == 'T'
+
+# potential
+pot = Potential.Potential(difficulty=choix_difficulte, random=choix_hasard)
 
 
 # robot
@@ -258,9 +509,6 @@ y0 = -20.0
 theta0 = np.pi/4.0
 robot = rob.Robot(x0, y0, theta0)
 
-
-# potential
-pot = Potential.Potential(difficulty=choix_difficulte, random=choix_hasard)
 
 # paramètres principaux
 pot_seuil = 300.0
@@ -277,6 +525,7 @@ nb_zones = choix_difficulte
 
 # stockage des mesures et états
 matrice_mesures = [[0.0 for _ in range(TAILLE_MATRICE)] for _ in range(TAILLE_MATRICE)]
+mesures_enregistrees = []
 file_points = []
 zones_trouvees = []
 mesures_cercle = []
@@ -293,7 +542,6 @@ pot_point_courant = None
 pot_centre_cercle = 0.0
 retour_active = False
 cercles_explores = []
-toutes_mesures_cercles = []
 cible_depuis_fusion = False
 historique_mesures_avance = []
 navigation_intelligente_active = False
@@ -374,7 +622,8 @@ for t in simu.t:
                 WPManager.xr = robot.x + math.cos(thetar)
                 WPManager.yr = robot.y + math.sin(thetar)
                 if timerMesure.isEllapsed(t):
-                    mettre_a_jour_matrice(matrice_mesures, robot.x, robot.y, pot_actuel)
+                    if mettre_a_jour_matrice(matrice_mesures, robot.x, robot.y, pot_actuel):
+                        mesures_enregistrees.append((robot.x, robot.y, pot_actuel))
                     if navigation_intelligente_active:
                         historique_mesures_avance.append((robot.x, robot.y, pot_actuel))
                         if len(historique_mesures_avance) > 3:
@@ -432,7 +681,8 @@ for t in simu.t:
                 continue
 
             if timerMesure.isEllapsed(t):
-                mettre_a_jour_matrice(matrice_mesures, robot.x, robot.y, pot_actuel)
+                if mettre_a_jour_matrice(matrice_mesures, robot.x, robot.y, pot_actuel):
+                    mesures_enregistrees.append((robot.x, robot.y, pot_actuel))
 
             if pot_actuel >= pot_seuil:
                 point_courant = (robot.x, robot.y)
@@ -458,7 +708,8 @@ for t in simu.t:
                 dist_obj = distance_points((robot.x, robot.y), point_objectif)
                 Vr = v_avance
                 if dist_obj <= tolerance_point:
-                    mettre_a_jour_matrice(matrice_mesures, robot.x, robot.y, pot_actuel)
+                    if mettre_a_jour_matrice(matrice_mesures, robot.x, robot.y, pot_actuel):
+                        mesures_enregistrees.append((robot.x, robot.y, pot_actuel))
                     point_objectif = None
                 if dist_obj <= RAYON_ACTIVATION_NAVIGATION:
                     navigation_intelligente_active = True
@@ -490,7 +741,8 @@ for t in simu.t:
             if dist_point <= tolerance_point:
                 point_courant = point_cible
                 pot_point_courant = pot_actuel
-                mettre_a_jour_matrice(matrice_mesures, robot.x, robot.y, pot_point_courant)
+                if mettre_a_jour_matrice(matrice_mesures, robot.x, robot.y, pot_point_courant):
+                    mesures_enregistrees.append((robot.x, robot.y, pot_point_courant))
                 etat = 'initialiser_cercle'
                 cible_depuis_fusion = False
                 point_objectif = None
@@ -534,7 +786,8 @@ for t in simu.t:
             if dist_point <= tolerance_point:
                 pot_point = pot_actuel
                 angle_point = point_temp[2]
-                mettre_a_jour_matrice(matrice_mesures, robot.x, robot.y, pot_point)
+                if mettre_a_jour_matrice(matrice_mesures, robot.x, robot.y, pot_point):
+                    mesures_enregistrees.append((robot.x, robot.y, pot_point))
                 mesures_cercle.append((pot_point, angle_point, (robot.x, robot.y)))
                 indice_cercle += 1
                 if indice_cercle >= len(points_cercle):
@@ -652,8 +905,6 @@ for t in simu.t:
                 'mesures': mesures_actuelles
             }
             cercles_explores.append(cercle_actuel)
-            if mesures_actuelles:
-                toutes_mesures_cercles.extend(mesures_actuelles)
             nettoyer_file_points(file_points, cercles_explores)
 
             mesures_cercle = []
@@ -693,13 +944,7 @@ for t in simu.t:
     simu.addData(robot, WPManager, Vr, thetar, omegar, pot.value([robot.x,robot.y]))
 
 # end of loop on simulation time
-
-print("Zones trouvées :", zones_trouvees)
 print("Temps de simulation :", round(temps_simu, 2), "s")
-print("Matrice des potentiels (indices -25 à 25) :")
-for ix in range(TAILLE_MATRICE):
-    ligne = matrice_mesures[ix]
-    print(" ".join(f"{valeur:6.1f}" for valeur in ligne))
 
 
 # close all figures
@@ -714,15 +959,18 @@ if zones_trouvees:
     ax.scatter(x_zones, y_zones, c='red', marker='o', s=60, label='Centre trouvé')
     ax.legend()
 
-simu.plotXYTheta(2)
+#simu.plotXYTheta(2)
 #simu.plotVOmega(3)
+#simu.plotPotential(4)
+#simu.plotPotential3D(5)
 
-simu.plotPotential(4)
-
-
-
-simu.plotPotential3D(5)
-
+reconstruire_carte_emissions(
+    matrice_mesures,
+    pot_seuil,
+    zones_trouvees,
+    rayon_detection=rayon_cercle,
+    mesures=mesures_enregistrees,
+)
 
 # show plots
 plt.show()
